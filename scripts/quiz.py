@@ -7,14 +7,25 @@ import random
 import re
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 
 DEFAULT_COUNT = 10
 MIN_COUNT = 10
 MAX_COUNT = 20
-QUESTION_HEADING = re.compile(r"^## \d{4}-\d{2}-\d{2}：.+", re.MULTILINE)
+OUTPUT_DIR = "quizzes"
+QUESTION_HEADING = re.compile(r"^## (?:\d{4}-\d{2}-\d{2}：|\d{3}\. ).+")
+FENCE_START = re.compile(r"^\s*(```|~~~)")
+STRUCTURED_ANSWER_MARKERS = (
+    "**我的回答**",
+    "**我的理解 / 回答**",
+    "**批改**",
+    "**记住**",
+)
 ANSWER_MARKERS = (
+    "**我的回答**",
+    "**我的理解 / 回答**",
     "**批改**",
     "**记住**",
 )
@@ -25,6 +36,7 @@ class Question:
     source: Path
     heading: str
     prompt: str
+    answer: str
 
 
 def repo_root() -> Path:
@@ -60,22 +72,42 @@ def markdown_files(root: Path) -> list[Path]:
     )
 
 
+def question_heading_offsets(text: str) -> list[int]:
+    offsets: list[int] = []
+    in_fence = False
+    offset = 0
+
+    for line in text.splitlines(keepends=True):
+        if FENCE_START.match(line):
+            in_fence = not in_fence
+        elif not in_fence and QUESTION_HEADING.match(line):
+            offsets.append(offset)
+
+        offset += len(line)
+
+    return offsets
+
+
 def split_question_blocks(text: str) -> list[str]:
-    matches = list(QUESTION_HEADING.finditer(text))
+    offsets = question_heading_offsets(text)
     blocks: list[str] = []
 
-    for index, match in enumerate(matches):
-        start = match.start()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+    for index, start in enumerate(offsets):
+        end = offsets[index + 1] if index + 1 < len(offsets) else len(text)
         blocks.append(text[start:end].strip())
 
     return blocks
 
 
-def hide_answers(block: str) -> tuple[str, str]:
+def split_prompt_and_answer(block: str) -> tuple[str, str, str]:
     lines = block.splitlines()
     heading = lines[0].removeprefix("## ").strip()
     body = "\n".join(lines[1:]).strip()
+
+    if not any(marker in body for marker in STRUCTURED_ANSWER_MARKERS):
+        prompt = "请根据题目作答。"
+        answer = body or "这道题没有找到答案内容，请回到原文件查看。"
+        return heading, prompt, answer
 
     cutoff = len(body)
     for marker in ANSWER_MARKERS:
@@ -85,9 +117,13 @@ def hide_answers(block: str) -> tuple[str, str]:
 
     prompt = body[:cutoff].strip()
     if not prompt:
-        prompt = "这道题没有找到可展示的问题内容，请回到原文件查看。"
+        prompt = "请根据题目作答。"
 
-    return heading, prompt
+    answer = body
+    if not answer:
+        answer = "这道题没有找到答案内容，请回到原文件查看。"
+
+    return heading, prompt, answer
 
 
 def load_questions(root: Path) -> list[Question]:
@@ -96,24 +132,95 @@ def load_questions(root: Path) -> list[Question]:
     for path in markdown_files(root):
         text = path.read_text(encoding="utf-8")
         for block in split_question_blocks(text):
-            heading, prompt = hide_answers(block)
+            heading, prompt, answer = split_prompt_and_answer(block)
             questions.append(
                 Question(
                     source=path.relative_to(root),
                     heading=heading,
                     prompt=prompt,
+                    answer=answer,
                 )
             )
 
     return questions
 
 
-def print_question(index: int, question: Question) -> None:
-    print(f"## {index}. {question.heading}")
-    print(f"来源：{question.source}")
-    print()
-    print(question.prompt)
-    print()
+def question_block(index: int, question: Question) -> str:
+    return "\n".join(
+        [
+            f"## {index}. {question.heading}",
+            f"来源：{question.source}",
+            "",
+            question.prompt,
+            "",
+        ]
+    )
+
+
+def answer_block(index: int, question: Question) -> str:
+    return "\n".join(
+        [
+            f"## {index}. {question.heading}",
+            f"来源：{question.source}",
+            "",
+            question.answer,
+            "",
+        ]
+    )
+
+
+def output_paths(root: Path) -> tuple[Path, Path]:
+    output_dir = root / OUTPUT_DIR
+    output_dir.mkdir(exist_ok=True)
+
+    today = date.today().isoformat()
+    suffix = ""
+    counter = 1
+
+    while True:
+        questions_path = output_dir / f"{today}{suffix}_questions.md"
+        answers_path = output_dir / f"{today}{suffix}_answers.md"
+
+        if not questions_path.exists() and not answers_path.exists():
+            return questions_path, answers_path
+
+        counter += 1
+        suffix = f"_{counter}"
+
+
+def render_questions(selected: list[Question], total: int) -> str:
+    parts = [
+        f"# 随机抽题：{len(selected)} / {total}",
+        "",
+        "先自己回答，再打开答案文件查看 `批改` 和 `记住`。",
+        "",
+    ]
+
+    for index, question in enumerate(selected, start=1):
+        parts.append(question_block(index, question))
+
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def render_answers(selected: list[Question], total: int) -> str:
+    parts = [
+        f"# 随机抽题答案：{len(selected)} / {total}",
+        "",
+        "这个文件保存对应题目的答案、批改和记忆重点。",
+        "",
+    ]
+
+    for index, question in enumerate(selected, start=1):
+        parts.append(answer_block(index, question))
+
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def write_quiz_files(root: Path, selected: list[Question], total: int) -> tuple[Path, Path]:
+    questions_path, answers_path = output_paths(root)
+    questions_path.write_text(render_questions(selected, total), encoding="utf-8")
+    answers_path.write_text(render_answers(selected, total), encoding="utf-8")
+    return questions_path, answers_path
 
 
 def main(argv: list[str]) -> int:
@@ -130,13 +237,12 @@ def main(argv: list[str]) -> int:
         count = len(questions)
 
     selected = random.sample(questions, count)
+    questions_path, answers_path = write_quiz_files(root, selected, len(questions))
 
-    print(f"# 随机抽题：{count} / {len(questions)}")
-    print("先自己回答，再回到原文件查看 `批改` 和 `记住`。")
-    print()
-
-    for index, question in enumerate(selected, start=1):
-        print_question(index, question)
+    print(f"已生成随机抽题：{count} / {len(questions)}")
+    print(f"题目文件：{questions_path.relative_to(root)}")
+    print(f"答案文件：{answers_path.relative_to(root)}")
+    print("先打开题目文件作答，再打开答案文件检查。")
 
     return 0
 
