@@ -47,6 +47,340 @@ Bash = 终端里的命令解释器 + 脚本执行器
 
 在 benchmark 项目里，Bash 负责指挥流程：读取 CSV、循环参数、设置环境变量、运行程序、保存日志、生成结果 CSV。
 
+## 2026-06-25：`bash -n` 是检查语法吗？
+
+**我的问题**
+
+`bash -n` 是检查语法吗？
+
+**批改**
+
+是。`bash -n` 会读取 Bash 脚本并检查语法，但不会真正执行脚本里的命令。
+
+例如在本地 WSL 可以写：
+
+```bash
+bash -n scripts/run/ksp/3d/run_3d_sizes.sbatch
+```
+
+如果没有输出，通常表示 Bash 语法检查通过。如果有语法错误，会显示 `syntax error` 之类的信息。
+
+但它只检查语法，不检查运行时逻辑。
+
+**记住**
+
+```text
+bash -n = 只解析脚本语法，不运行脚本。
+```
+
+它检查不出变量是否未定义、文件路径是否存在、`cc` 是否能编译成功、`srun` 参数是否合理。
+
+## 2026-06-25：为什么 `bash -n` 检查不出很多 sbatch 问题？
+
+**我的问题**
+
+感觉 `bash -n 3d/run_3d_sizes.sbatch` 很多问题检查不出来。
+
+**批改**
+
+这个感觉是对的。`bash -n` 只回答“这是不是合法 Bash 语法”，不能回答“这个 benchmark 脚本能不能正确跑”。
+
+例如这些问题，`bash -n` 通常检查不出来：
+
+```bash
+echo "${MAX_CORES}"
+```
+
+如果 `MAX_CORES` 没定义，语法仍然合法。只有真正运行脚本，并且脚本里有：
+
+```bash
+set -u
+```
+
+才会在读取未定义变量时报错。
+
+它也检查不出：
+
+- `SIZE_TABLE` 文件是否存在。
+- `M`、`N`、`P`、`UNKNOWNS` 是否在使用前已经有值。
+- PETSc 路径是否正确。
+- `cc` 是否能链接 PETSc。
+- `srun` 是否能在 HPC 集群上正常启动任务。
+
+**记住**
+
+```text
+bash -n 检查语法。
+set -euo pipefail + 小规模真实运行，才能暴露更多运行时问题。
+```
+
+本地 WSL 可以先做语法检查；HPC 集群上再用小规模参数做真实测试。
+
+## 2026-06-25：`bash -2n` 是什么意思？
+
+**我的问题**
+
+`bash -2n` 是什么意思？
+
+**批改**
+
+`bash -2n` 不是常用的 Bash 语法检查写法，大概率是把 `bash -n` 打错了。
+
+正确写法是：
+
+```bash
+bash -n script.sh
+```
+
+如果写成：
+
+```bash
+bash -2n script.sh
+```
+
+Bash 会尝试解析 `-2n` 这组选项，但 `-2` 不是 Bash 的合法选项，通常会报 `invalid option`。
+
+**记住**
+
+```text
+检查 Bash 语法：bash -n 文件名
+```
+
+## 2026-06-25：3D 脚本里的 `cc ... -lpetsc -o "${EXE}"` 是什么意思？
+
+**我的问题**
+
+在 3D 脚本里，这段是什么意思？
+
+```bash
+echo "[BUILD] Compiling ${SRC_PROG} -> ${EXE}"
+cc -O3 -fopenmp \
+  -I"${PETSC_DIR}/include" -I"${PETSC_DIR}/${PETSC_ARCH}/include" \
+  "${SRC_PROG}" -L"${PETSC_DIR}/${PETSC_ARCH}/lib" -Wl,-rpath,"${PETSC_DIR}/${PETSC_ARCH}/lib" -lpetsc -o "${EXE}"
+```
+
+**批改**
+
+这段是在把自己的 3D C 程序编译成可执行文件。
+
+整体意思是：
+
+```text
+用 Cray 的 C 编译器 wrapper cc，打开优化和 OpenMP，
+找到 PETSc 的头文件和库文件，
+把 3d-stencil.c 编译并链接成 3d-stencil 可执行程序。
+```
+
+各部分含义：
+
+- `cc`：Cray 环境里的 C 编译器 wrapper，会配合 `PrgEnv-gnu` 和 `cray-mpich` 处理编译环境。
+- `-O3`：开启较高级别优化，适合 benchmark。
+- `-fopenmp`：开启 OpenMP 支持。
+- `-I.../include`：告诉编译器去哪里找 PETSc 头文件，比如 `petscksp.h`。
+- `"${SRC_PROG}"`：要编译的 C 源文件。
+- `-L.../lib`：告诉链接器去哪里找 PETSc 库文件。
+- `-Wl,-rpath,.../lib`：把 PETSc 库路径写进可执行文件，帮助运行时找到 `libpetsc.so`。
+- `-lpetsc`：链接 PETSc 库。
+- `-o "${EXE}"`：指定输出的可执行文件路径。
+
+**记住**
+
+2D 的 `ex2` 是 PETSc 自带 tutorial，所以可以用 PETSc 的 Makefile：
+
+```bash
+make -j PETSC_DIR="${PETSC_DIR}" PETSC_ARCH="${PETSC_ARCH}" ex2
+```
+
+3D 的 `3d-stencil.c` 是自己的程序，所以脚本手动写 `cc ...` 来编译和链接 PETSc。
+
+## 2026-06-25：`(( T in THREADS_LIST )) && continue` 对吗？
+
+**我的问题**
+
+这个语法对吗？
+
+```bash
+(( T in THREADS_LIST )) && continue
+```
+
+**批改**
+
+不对。Bash 的 `(( ... ))` 是算术表达式，里面不能用 Python 那种 `in` 来判断某个值是否在列表里。
+
+如果只是遍历线程列表，应该直接写：
+
+```bash
+for T in "${THREADS_LIST[@]}"; do
+  ...
+done
+```
+
+这样 `T` 本来就只会来自 `THREADS_LIST`。
+
+如果要判断 `R * T` 是否满足满节点 128 核，可以写：
+
+```bash
+(( R * T != 128 )) && continue
+```
+
+如果真的要判断某个值是否在数组里，可以写函数：
+
+```bash
+contains_thread() {
+  local needle="$1"
+  local t
+  for t in "${THREADS_LIST[@]}"; do
+    [[ "${t}" == "${needle}" ]] && return 0
+  done
+  return 1
+}
+
+contains_thread "${T}" || continue
+```
+
+**记住**
+
+```text
+Bash 里没有 (( x in array )) 这种数组包含判断。
+```
+
+数组包含判断通常用循环函数完成。
+
+## 2026-06-25：`T=$(( 128 / R ))` 语法对吗？
+
+**我的问题**
+
+这个语法是对的吧？
+
+```bash
+T=$(( 128 / R ))
+```
+
+**批改**
+
+对。这是 Bash 的整数算术表达式。意思是计算 `128 / R`，然后把结果赋值给 `T`。
+
+例如：
+
+```bash
+R=16
+T=$(( 128 / R ))
+echo "${T}"
+```
+
+输出：
+
+```text
+8
+```
+
+注意 Bash 这里是整数除法。如果不能整除，会截断小数。
+
+**记住**
+
+```text
+$(( ... )) = Bash 整数算术计算。
+```
+
+在 ARCHER2 单节点 128 物理核的设置里，如果 `R=16 32 64 128`，那么 `T=8 4 2 1`，可以保持：
+
+```text
+R * T = 128
+```
+
+## 2026-06-25：`contains_thread "${T}" || continue` 里的 `||` 是什么意思？
+
+**我的问题**
+
+这里面的 `||` 是什么意思？
+
+```bash
+contains_thread "${T}" || continue
+```
+
+就是 or 还是 if else 中的 else？
+
+**批改**
+
+`||` 是 OR，但在 Bash 里常用作“前面的命令失败时，才执行后面的命令”。
+
+这句等价于：
+
+```bash
+if ! contains_thread "${T}"; then
+  continue
+fi
+```
+
+Bash 命令有返回状态：
+
+- 返回 `0`：成功，表示真。
+- 返回非 `0`：失败，表示假。
+
+所以：
+
+```bash
+A || B
+```
+
+可以读成：
+
+```text
+如果 A 失败，就执行 B。
+```
+
+**记住**
+
+```bash
+contains_thread "${T}" || continue
+```
+
+可以读成：
+
+```text
+如果 T 不在允许的线程列表里，就跳过当前循环。
+```
+
+## 2026-06-25：`ts()` 函数是什么意思？
+
+**我的问题**
+
+`ts()` 这个函数是什么意思？
+
+**批改**
+
+`ts` 大概是 `timestamp` 的缩写。在脚本里：
+
+```bash
+ts() { date -Iseconds; }
+```
+
+意思是定义一个 Bash 函数。每次调用 `ts`，就执行：
+
+```bash
+date -Iseconds
+```
+
+它会输出当前时间，例如：
+
+```text
+2026-06-25T16:42:10+01:00
+```
+
+后面这样用：
+
+```bash
+echo "[RUN] $(ts) scale=${SCALE} ppn=${R} threads=${T}"
+```
+
+`$(ts)` 会运行 `ts` 函数，并把它输出的时间插入到字符串里。
+
+**记住**
+
+```text
+ts() = 一个小函数，用来给日志和 CSV 记录当前时间。
+```
+
 ## 2026-06-17：`RANKS=16` 一次只能设一个数字吗？
 
 **我的问题**
