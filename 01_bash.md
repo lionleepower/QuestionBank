@@ -1609,3 +1609,180 @@ $@ = 所有参数
 ```
 
 在函数里，它们表示传给函数的参数；在脚本最外层，它们表示传给脚本的命令行参数。
+
+## 2026-06-29：为什么 `SCALES` 有四个值，但 sbatch 只跑了 `small`？
+
+**我的问题**
+
+脚本里写了：
+
+```bash
+SCALES="${SCALES:-small medium large very-large}"
+```
+
+作业输出里也显示：
+
+```text
+SCALES=small medium large very-large
+```
+
+CSV 文件也确实有四行：
+
+```text
+small
+medium
+large
+very-large
+```
+
+但是 sbatch 实际只跑了 `small`，然后就 `Completed`，没有报错，也没有继续跑 `medium`、`large`、`very-large`。
+
+**我的理解 / 回答**
+
+一开始怀疑是 `SCALES="${SCALES:-small medium large very-large}"` 写法不合法，或者 CSV 文件没有同步到集群。
+
+后来检查发现：
+
+- `SCALES` 写法是合法的。
+- 作业输出里 `SCALES` 确实包含四个 scale。
+- 集群上的 `2Dproblem_sizes.csv` 也确实包含四个 scale。
+
+所以问题不是 scale 列表，而是循环读 CSV 的方式。
+
+**批改**
+
+真正的问题在这个结构：
+
+```bash
+while IFS=, read -r SCALE M N UNKNOWNS; do
+  ...
+  srun ...
+done < "${SIZE_TABLE}"
+```
+
+`done < "${SIZE_TABLE}"` 的意思是：整个 `while` 循环从 CSV 文件读取标准输入。
+
+因此循环内部的命令默认也会继承这个标准输入。也就是说，`srun` 也可能从同一个 CSV 文件读 stdin。
+
+如果 `srun` 或 MPI 程序读取了 stdin，它可能会把 CSV 后面的行消耗掉。外层的 `read` 下一轮就读不到 `medium`、`large`、`very-large`，于是循环提前结束。
+
+修复方式是让 `srun` 不要读取 CSV，而是读取一个空输入源：
+
+```bash
+srun ... \
+  < /dev/null | tee "${LOG}"
+```
+
+`/dev/null` 可以理解成一个永远为空的输入文件。这样就算 `srun` 想读 stdin，也只能读到空内容，不会偷走 CSV 的后续行。
+
+**记住**
+
+```text
+while read ...; do
+  command
+done < file.csv
+```
+
+这种结构里，循环内部的命令也可能继承 `file.csv` 作为 stdin。
+
+如果内部命令可能读 stdin，比如：
+
+```text
+srun
+mpirun
+ssh
+```
+
+就应该写：
+
+```bash
+command < /dev/null
+```
+
+保护外层 `while read` 的输入。
+
+## 2026-06-29：为什么 `< /dev/null \ ` 后面接 `| tee` 会报语法错误？
+
+**我的问题**
+
+我把命令写成：
+
+```bash
+srun ... \
+  < /dev/null \ 
+  | tee "${LOG}"
+```
+
+然后 sbatch 报错：
+
+```text
+syntax error near unexpected token `|'
+```
+
+为什么这里的 `|` 会变成语法错误？
+
+**我的理解 / 回答**
+
+我以为反斜杠 `\` 只要出现在行尾附近就可以继续下一行，所以写成了：
+
+```bash
+< /dev/null \ 
+```
+
+但实际这里反斜杠后面多了一个空格。
+
+**批改**
+
+Bash 里的续行反斜杠必须是这一行的最后一个字符。
+
+正确：
+
+```bash
+< /dev/null \
+```
+
+错误：
+
+```bash
+< /dev/null \ 
+```
+
+第二种写法里，反斜杠后面还有空格，所以它不再表示“续到下一行”。结果下一行的：
+
+```bash
+| tee "${LOG}"
+```
+
+就变成了一个没有左侧命令的管道，因此 Bash 报：
+
+```text
+syntax error near unexpected token `|'
+```
+
+更稳的写法是把重定向和管道放在同一行：
+
+```bash
+< /dev/null | tee "${LOG}"
+```
+
+这样不需要在 `< /dev/null` 后再写一个续行反斜杠，也就不容易被行尾空格坑到。
+
+**记住**
+
+```text
+Bash 续行的 \ 后面不能有任何字符，包括空格。
+```
+
+如果看到：
+
+```text
+syntax error near unexpected token `|'
+```
+
+要检查上一行的续行反斜杠后面是不是有空格。
+
+在这种场景下，优先写：
+
+```bash
+< /dev/null | tee "${LOG}"
+```
